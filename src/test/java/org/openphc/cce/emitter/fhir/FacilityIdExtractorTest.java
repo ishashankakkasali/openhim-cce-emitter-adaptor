@@ -82,6 +82,74 @@ class FacilityIdExtractorTest {
             IBaseResource resource = fhirContext.newJsonParser().parseResource(json);
             assertThat(extractor.extract(resource)).isEqualTo("0030");
         }
+
+        @Test
+        void prefersSourceFacilityExtensionOverLocation() {
+            // Plain visit/consultation encounters: location and extension agree, so this is not
+            // observable in practice, but the extension must still win per the documented order.
+            Encounter encounter = new Encounter();
+            encounter.addLocation().setLocation(new Reference("Location/0030"));
+            encounter.addExtension(new Extension(
+                    "http://example.org/fhir/StructureDefinition/source-facility", new StringType("0030")));
+
+            assertThat(extractor.extract(encounter)).isEqualTo("0030");
+        }
+
+        @Test
+        void fallsBackToLocationWhenNoSourceFacilityExtension() {
+            Encounter encounter = new Encounter();
+            encounter.addLocation().setLocation(new Reference("Location/0030"));
+
+            assertThat(extractor.extract(encounter)).isEqualTo("0030");
+        }
+
+        @Test
+        void transferEncounterUsesSourceFacilityNotDestinationLocation() {
+            // Regression test for a real production incident (2026-07-17): a TRANSFER_ENCOUNTER's
+            // location[0].location is the transfer DESTINATION, not the reporting facility, so
+            // extracting from it compared a destination-facility UUID against FACILITY_FILTER_IDS
+            // (short numeric codes) — which can never match, silently dropping every transfer-out
+            // event regardless of whether the true reporting facility was allow-listed. The
+            // source-facility extension (and hospitalization.origin) correctly carry "1651"; the
+            // fix makes the extension take priority for Encounter so the filter checks the right ID.
+            Encounter encounter = new Encounter();
+            encounter.addLocation().setLocation(
+                    new Reference("Location/d297cb62-4920-4c70-ba42-eedf32a69043")); // transfer destination (Ruli DH)
+            encounter.addExtension(new Extension(
+                    "http://example.org/fhir/StructureDefinition/source-facility", new StringType("1651")));
+
+            assertThat(extractor.extract(encounter)).isEqualTo("1651");
+        }
+
+        @Test
+        void extractsFromParsedTransferEncounterPayload() {
+            String json = """
+                    {
+                      "resourceType": "Encounter",
+                      "id": "89aeba57-f024-432b-bc2f-379402fe0232",
+                      "status": "finished",
+                      "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode", "code": "EMER"},
+                      "type": [{"coding": [{"display": "TRANSFER_ENCOUNTER"}]}],
+                      "subject": {"reference": "Patient/260227-1651-7600"},
+                      "hospitalization": {
+                        "origin": {"reference": "Location/1651",
+                          "identifier": {"system": "http://fhir.openmrs.org/ext/fosa-code", "value": "1651"},
+                          "display": "Minazi Health Center"},
+                        "destination": {"reference": "Location/d297cb62-4920-4c70-ba42-eedf32a69043",
+                          "identifier": {"system": "http://fhir.openmrs.org/ext/fosa-code", "value": "0302"},
+                          "display": "Ruli DH"}
+                      },
+                      "location": [{"location": {"reference": "Location/d297cb62-4920-4c70-ba42-eedf32a69043",
+                        "display": "Ruli DH"}, "status": "completed"}],
+                      "extension": [
+                        {"url": "http://example.org/fhir/StructureDefinition/source-system", "valueString": "eBuzima"},
+                        {"url": "http://example.org/fhir/StructureDefinition/source-facility", "valueString": "1651"}
+                      ]
+                    }
+                    """;
+            IBaseResource resource = fhirContext.newJsonParser().parseResource(json);
+            assertThat(extractor.extract(resource)).isEqualTo("1651");
+        }
     }
 
     // ── ServiceRequest (locationReference[]) ─────────────────────────────────

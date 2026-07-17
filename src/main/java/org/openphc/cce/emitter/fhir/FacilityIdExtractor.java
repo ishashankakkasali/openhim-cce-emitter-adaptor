@@ -18,11 +18,14 @@ import java.util.List;
  *
  * <p>Extraction strategies (tried in order):
  * <ol>
- *   <li>{@code Encounter.location[0].location} — nested component, handled explicitly</li>
- *   <li>{@code getLocationReference()} returning {@code List<Reference>} — e.g. {@code ServiceRequest}</li>
- *   <li>{@code getLocation()} returning a direct {@code Reference} — e.g. {@code Procedure}, {@code Immunization}</li>
- *   <li>{@code source-facility} extension — fallback carried by every resource type
- *       (e.g. {@code Observation}, {@code Condition}, {@code MedicationRequest}) that has no FHIR location</li>
+ *   <li>For {@code Encounter}: the {@code source-facility} extension first, then
+ *       {@code location[0].location} as a fallback — see {@link #extractFromEncounter} for why
+ *       the extension takes priority here specifically.</li>
+ *   <li>For every other resource type: {@code getLocationReference()} returning
+ *       {@code List<Reference>} (e.g. {@code ServiceRequest}), then {@code getLocation()}
+ *       returning a direct {@code Reference} (e.g. {@code Procedure}, {@code Immunization}),
+ *       then the {@code source-facility} extension as a fallback (e.g. {@code Observation},
+ *       {@code Condition}, {@code MedicationRequest}, which have no FHIR location at all).</li>
  * </ol>
  *
  * <p>Any {@code ResourceType/id} prefix (e.g. {@code Location/0030}, {@code Organization/1302})
@@ -48,12 +51,13 @@ public class FacilityIdExtractor {
      *
      * <p>Resolution order:
      * <ol>
-     *   <li>{@code Encounter} — reads the nested {@code location[0].location} component</li>
-     *   <li>Any resource with {@code locationReference[]} (e.g. {@code ServiceRequest}) —
+     *   <li>{@code Encounter} — the {@code source-facility} extension first, {@code
+     *       location[0].location} as a fallback. See {@link #extractFromEncounter} for why.</li>
+     *   <li>Any other resource with {@code locationReference[]} (e.g. {@code ServiceRequest}) —
      *       first entry's reference is used</li>
-     *   <li>Any resource with a direct {@code location} {@link Reference}
+     *   <li>Any other resource with a direct {@code location} {@link Reference}
      *       (e.g. {@code Procedure}, {@code Immunization})</li>
-     *   <li>Fallback for all resource types: the {@code source-facility} extension
+     *   <li>Fallback for all non-Encounter resource types: the {@code source-facility} extension
      *       (e.g. {@code Observation}, {@code Condition}, {@code MedicationRequest})</li>
      * </ol>
      *
@@ -69,23 +73,20 @@ public class FacilityIdExtractor {
             return null;
         }
 
-        // 1. Location-based extraction.
-        // Encounter.location[] holds EncounterLocationComponent (not a plain Reference),
-        // so it needs explicit handling rather than the generic reflection path below.
-        String facilityId;
         if (resource instanceof Encounter encounter) {
-            facilityId = extractFromEncounter(encounter);
-        } else {
-            // Try locationReference[] (e.g. ServiceRequest) then location (e.g. Procedure, Immunization)
-            // Both List<Reference> and direct Reference shapes are handled by the same reflective helper.
-            Reference locationRef = resolveLocationReference(resource, "getLocationReference");
-            if (locationRef == null) {
-                locationRef = resolveLocationReference(resource, "getLocation");
-            }
-            facilityId = locationRef != null ? extractId(locationRef, resource.fhirType()) : null;
+            return extractFromEncounter(encounter);
         }
 
-        // 2. Fallback: the source system's 'source-facility' extension, carried by every
+        // Location-based extraction for non-Encounter types.
+        // Try locationReference[] (e.g. ServiceRequest) then location (e.g. Procedure, Immunization).
+        // Both List<Reference> and direct Reference shapes are handled by the same reflective helper.
+        Reference locationRef = resolveLocationReference(resource, "getLocationReference");
+        if (locationRef == null) {
+            locationRef = resolveLocationReference(resource, "getLocation");
+        }
+        String facilityId = locationRef != null ? extractId(locationRef, resource.fhirType()) : null;
+
+        // Fallback: the source system's 'source-facility' extension, carried by every
         // resource type (Observation, Condition, MedicationRequest, ...) — including those
         // that have no FHIR location, which is why they previously resolved no facility.
         if (facilityId == null) {
@@ -96,15 +97,37 @@ public class FacilityIdExtractor {
     }
 
     /**
-     * Extracts the facility ID from {@code Encounter.location[0].location}.
+     * Extracts the facility ID for an {@code Encounter}: the {@code source-facility} extension
+     * first, falling back to {@code location[0].location} only when the extension is absent.
+     *
+     * <p>Unlike other resource types, {@code Encounter.location[]} does not reliably identify the
+     * <em>reporting</em> facility — its role depends on the encounter type. For a plain visit or
+     * consultation it matches the reporting facility, but for a {@code TRANSFER_ENCOUNTER} it holds
+     * the transfer <em>destination</em> (e.g. {@code "location": [{"location": {"reference":
+     * "Location/<destination-uuid>"}}]}), while the actual source system facility is only present
+     * in the {@code source-facility} extension (and, redundantly, {@code hospitalization.origin}).
+     * Trusting {@code location[0]} for a transfer therefore compares a destination-facility UUID
+     * against {@code FACILITY_FILTER_IDS} — a list of short numeric codes — which can never match,
+     * so every transfer-out event was silently dropped by the facility filter regardless of
+     * whether the true reporting facility was allow-listed.
+     *
+     * <p>{@code source-facility} is the source system's own unambiguous facility declaration and is
+     * present on both plain encounters and transfers (confirmed identical to {@code location[0]}'s
+     * value for plain visit/consultation encounters), so preferring it here fixes the transfer case
+     * without changing behavior for any other encounter type.
      *
      * <p>Example payload fragment:
      * <pre>{@code
      * "location": [{ "location": { "reference": "Location/0030" } }]
      * }</pre>
-     * → returns {@code "0030"}
+     * → returns {@code "0030"} (no source-facility extension present)
      */
     private String extractFromEncounter(Encounter encounter) {
+        String facilityId = extractFromSourceFacilityExtension(encounter);
+        if (facilityId != null) {
+            return facilityId;
+        }
+
         List<Encounter.EncounterLocationComponent> locations = encounter.getLocation();
         if (locations == null || locations.isEmpty()) {
             return null;
@@ -126,8 +149,10 @@ public class FacilityIdExtractor {
      * }</pre>
      * → returns {@code "0007"}.
      *
-     * <p>This is the fallback that gives a facility to resources with no FHIR {@code location}
-     * (e.g. {@code Observation}, {@code Condition}, {@code MedicationRequest}).
+     * <p>For {@code Encounter} this is checked first (see {@link #extractFromEncounter}); for
+     * every other resource type it is the fallback that gives a facility to resources with no
+     * FHIR {@code location} at all (e.g. {@code Observation}, {@code Condition},
+     * {@code MedicationRequest}).
      *
      * @param resource the parsed FHIR R4 resource
      * @return the facility ID from the extension, or {@code null} if it is absent or empty

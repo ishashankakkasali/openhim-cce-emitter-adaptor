@@ -84,39 +84,54 @@ class FacilityIdExtractorTest {
         }
 
         @Test
-        void prefersSourceFacilityExtensionOverLocation() {
-            // Plain visit/consultation encounters: location and extension agree, so this is not
-            // observable in practice, but the extension must still win per the documented order.
+        void prefersHospitalizationOriginOverLocation() {
+            // TRANSFER_ENCOUNTER carries both hospitalization.origin (the true source) and
+            // location[0] (the destination) — origin must win.
+            Encounter encounter = new Encounter();
+            encounter.addLocation().setLocation(new Reference("Location/0302")); // destination
+            Encounter.EncounterHospitalizationComponent hospitalization = new Encounter.EncounterHospitalizationComponent();
+            hospitalization.setOrigin(new Reference("Location/0030")); // origin
+            encounter.setHospitalization(hospitalization);
+
+            assertThat(extractor.extract(encounter)).isEqualTo("0030");
+        }
+
+        @Test
+        void fallsBackToLocationWhenNoHospitalization() {
+            // Plain visit/consultation encounters never carry hospitalization at all.
             Encounter encounter = new Encounter();
             encounter.addLocation().setLocation(new Reference("Location/0030"));
+
+            assertThat(extractor.extract(encounter)).isEqualTo("0030");
+        }
+
+        @Test
+        void ignoresSourceFacilityExtensionForEncounter() {
+            // The source-facility extension is never consulted for Encounter — not even as a
+            // last resort when neither hospitalization nor location resolves.
+            Encounter encounter = new Encounter();
             encounter.addExtension(new Extension(
-                    "http://example.org/fhir/StructureDefinition/source-facility", new StringType("0030")));
+                    "http://example.org/fhir/StructureDefinition/source-facility", new StringType("9999")));
 
-            assertThat(extractor.extract(encounter)).isEqualTo("0030");
+            assertThat(extractor.extract(encounter)).isNull();
         }
 
         @Test
-        void fallsBackToLocationWhenNoSourceFacilityExtension() {
-            Encounter encounter = new Encounter();
-            encounter.addLocation().setLocation(new Reference("Location/0030"));
-
-            assertThat(extractor.extract(encounter)).isEqualTo("0030");
-        }
-
-        @Test
-        void transferEncounterUsesSourceFacilityNotDestinationLocation() {
+        void transferEncounterUsesHospitalizationOriginNotDestinationLocation() {
             // Regression test for a real production incident (2026-07-17): a TRANSFER_ENCOUNTER's
             // location[0].location is the transfer DESTINATION, not the reporting facility, so
             // extracting from it compared a destination-facility UUID against FACILITY_FILTER_IDS
             // (short numeric codes) — which can never match, silently dropping every transfer-out
-            // event regardless of whether the true reporting facility was allow-listed. The
-            // source-facility extension (and hospitalization.origin) correctly carry "1651"; the
-            // fix makes the extension take priority for Encounter so the filter checks the right ID.
+            // event regardless of whether the true reporting facility was allow-listed. Per FHIR R4
+            // (https://hl7.org/fhir/R4/encounter.html), hospitalization is only ever populated on a
+            // TRANSFER_ENCOUNTER, and hospitalization.origin correctly carries "1651"; the fix reads
+            // origin directly rather than relying on the source-facility extension as a proxy for it.
             Encounter encounter = new Encounter();
             encounter.addLocation().setLocation(
                     new Reference("Location/d297cb62-4920-4c70-ba42-eedf32a69043")); // transfer destination (Ruli DH)
-            encounter.addExtension(new Extension(
-                    "http://example.org/fhir/StructureDefinition/source-facility", new StringType("1651")));
+            Encounter.EncounterHospitalizationComponent hospitalization = new Encounter.EncounterHospitalizationComponent();
+            hospitalization.setOrigin(new Reference("Location/1651"));
+            encounter.setHospitalization(hospitalization);
 
             assertThat(extractor.extract(encounter)).isEqualTo("1651");
         }

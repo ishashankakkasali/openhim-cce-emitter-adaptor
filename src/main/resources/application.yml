@@ -56,6 +56,8 @@ cce:
         client-id: spice-fhir-client
       openmrs:
         client-id: openmrs-fhir-client
+      spice-facility:
+        client-id: spice-facility-client
 
 # Actuator & Metrics
 management:
